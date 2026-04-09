@@ -7,6 +7,8 @@ Also initialises the shared trades_* tables via the paper trader.
 
 from __future__ import annotations
 
+import json
+
 from shared.storage import BaseStorage
 from botd.config import DB_PATH
 
@@ -192,6 +194,7 @@ CREATE TABLE IF NOT EXISTS liq_upcoming_matches (
     match_format     TEXT,
     prize_pool       TEXT,
     stream_url       TEXT,
+    veto_maps        TEXT,            -- JSON list of map names when veto is known
     updated_at       TEXT DEFAULT (datetime('now'))
 );
 
@@ -372,7 +375,11 @@ class BotDStorage(BaseStorage):
     # ------------------------------------------------------------------
 
     def upsert_upcoming_match(self, match: dict):
+        match = dict(match)  # don't mutate caller's dict
         match.setdefault("updated_at", self.now())
+        # Serialize list fields to JSON for TEXT storage
+        if isinstance(match.get("veto_maps"), list):
+            match["veto_maps"] = json.dumps(match["veto_maps"])
         self.upsert("liq_upcoming_matches", match, ["match_id"])
 
     def upsert_tournament(self, tourn: dict):
@@ -381,17 +388,26 @@ class BotDStorage(BaseStorage):
 
     def get_upcoming_matches(self, game: str = None, days: int = 7) -> list[dict]:
         if game:
-            return self.execute(
+            rows = self.execute(
                 "SELECT * FROM liq_upcoming_matches "
                 "WHERE game=? AND match_datetime >= datetime('now') "
                 "  AND match_datetime <= datetime('now', ? || ' days') "
                 "ORDER BY match_datetime ASC",
                 (game, str(days)),
             )
-        return self.execute(
-            "SELECT * FROM liq_upcoming_matches "
-            "WHERE match_datetime >= datetime('now') "
-            "  AND match_datetime <= datetime('now', ? || ' days') "
-            "ORDER BY match_datetime ASC",
-            (str(days),),
-        )
+        else:
+            rows = self.execute(
+                "SELECT * FROM liq_upcoming_matches "
+                "WHERE match_datetime >= datetime('now') "
+                "  AND match_datetime <= datetime('now', ? || ' days') "
+                "ORDER BY match_datetime ASC",
+                (str(days),),
+            )
+        # Deserialize JSON fields
+        for row in rows:
+            if isinstance(row.get("veto_maps"), str):
+                try:
+                    row["veto_maps"] = json.loads(row["veto_maps"])
+                except (json.JSONDecodeError, TypeError):
+                    row["veto_maps"] = []
+        return rows

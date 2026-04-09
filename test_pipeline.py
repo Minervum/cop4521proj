@@ -22,7 +22,7 @@ import json
 import logging
 import os
 import sys
-from datetime import datetime
+from datetime import datetime, timedelta
 from pprint import pprint
 
 # Ensure project root is on path
@@ -45,6 +45,8 @@ from botd.data.hltv import HLTVScraper
 from botd.data.vlr import VLRScraper
 from botd.data.liquipedia import LiquipediaScraper
 from botd.signals import EsportsSignalEngine
+from botd.engine.elo import EloEngine
+from botd.engine.signals import EloSignalEngine
 from shared.kelly import half_kelly, edge, best_side
 
 PASS = "\033[92mPASS\033[0m"
@@ -357,47 +359,52 @@ def test_match_snapshot(upcoming_matches: list):
 def test_signals(upcoming_matches: list, offline: bool = False):
     section("Test 7: Signal Engine")
 
-    if offline and not upcoming_matches:
-        print(f"  [{INFO}] Offline + no cached matches — seeding synthetic match for model test")
-        # Inject synthetic upcoming matches so the model can run without network
+    if offline:
+        # In offline mode, always ensure at least one match per game is seeded so
+        # the signal engine can run without touching the network.
         db = BotDStorage(TEST_DB)
         now = datetime.utcnow()
-        synthetic = [
-            {
+        existing_ids = {m["match_id"] for m in (upcoming_matches or [])}
+        synthetic = []
+        if not any(m.get("game") == "cs2" for m in (upcoming_matches or [])):
+            cs2_match = {
                 "match_id": "test_cs2_001",
                 "game": "cs2",
                 "team1": "Team Alpha",
                 "team2": "Team Beta",
                 "team1_id": "hltv_alpha",
                 "team2_id": "hltv_beta",
-                "match_datetime": (now.replace(hour=18, minute=0, second=0)).isoformat(sep=" ", timespec="seconds"),
+                "match_datetime": (now + timedelta(hours=3)).strftime("%Y-%m-%d %H:%M:%S"),
                 "tournament": "Test Tournament",
                 "tournament_tier": "A",
                 "match_format": "Bo3",
                 "prize_pool": "$200,000",
                 "stream_url": "",
                 "updated_at": db.now(),
-            },
-            {
+            }
+            db.upsert_upcoming_match(cs2_match)
+            synthetic.append(cs2_match)
+        if not any(m.get("game") == "val" for m in (upcoming_matches or [])):
+            val_match = {
                 "match_id": "test_val_001",
                 "game": "val",
                 "team1": "Sentinels",
                 "team2": "NRG",
                 "team1_id": "vlr_sentinels",
                 "team2_id": "vlr_nrg",
-                "match_datetime": (now.replace(hour=20, minute=0, second=0)).isoformat(sep=" ", timespec="seconds"),
+                "match_datetime": (now + timedelta(hours=4)).strftime("%Y-%m-%d %H:%M:%S"),
                 "tournament": "VCT Americas",
                 "tournament_tier": "S",
                 "match_format": "Bo3",
                 "prize_pool": "$1,000,000",
                 "stream_url": "",
                 "updated_at": db.now(),
-            },
-        ]
-        for m in synthetic:
-            db.upsert_upcoming_match(m)
-        upcoming_matches = synthetic
-        print(f"  [{INFO}] Injected {len(synthetic)} synthetic matches for model test")
+            }
+            db.upsert_upcoming_match(val_match)
+            synthetic.append(val_match)
+        if synthetic:
+            upcoming_matches = list(upcoming_matches or []) + synthetic
+            print(f"  [{INFO}] Seeded {len(synthetic)} synthetic matches for offline model test")
 
     engine = EsportsSignalEngine(TEST_DB)
     print("  Generating signals from all upcoming matches...")
@@ -452,11 +459,303 @@ def test_signals(upcoming_matches: list, offline: bool = False):
 
 
 # ------------------------------------------------------------------
-# Test 8: Kelly sizing sanity check
+# Test 8: ELO engine
+# ------------------------------------------------------------------
+
+def test_elo_engine():
+    section("Test 8: Two-Layer ELO Engine")
+    db  = BotDStorage(TEST_DB)
+    elo = EloEngine(TEST_DB)
+
+    # ── ELO schema tables ────────────────────────────────────────
+    elo_tables = ["elo_team_ratings", "elo_match_log", "elo_venue_stats"]
+    tables = [r["name"] for r in db.execute(
+        "SELECT name FROM sqlite_master WHERE type='table'"
+    )]
+    for t in elo_tables:
+        check(t in tables, f"ELO table '{t}' created")
+
+    # ── Core math ────────────────────────────────────────────────
+    p = EloEngine.expected_score(1600, 1400)
+    check(abs(p - 0.7597) < 0.001, f"expected_score(1600,1400) ≈ 0.760 (got {p:.4f})")
+
+    p_eq = EloEngine.expected_score(1500, 1500)
+    check(abs(p_eq - 0.5) < 1e-9, f"expected_score(equal ELOs) = 0.500 (got {p_eq})")
+
+    k_bo1 = EloEngine.effective_k("Bo1", months_ago=0)
+    k_bo3 = EloEngine.effective_k("Bo3", months_ago=0)
+    k_bo5 = EloEngine.effective_k("Bo5", months_ago=0)
+    check(k_bo1 > k_bo3 > k_bo5, f"K-factor order: Bo1={k_bo1} > Bo3={k_bo3} > Bo5={k_bo5}")
+
+    k_old = EloEngine.effective_k("Bo3", months_ago=6)
+    check(abs(k_old - 24 * 0.85**6) < 0.001,
+          f"6-month decay: K_eff={k_old:.3f} (expected {24*0.85**6:.3f})")
+
+    r1, r2 = EloEngine.update_ratings(1500, 1500, True, 24)
+    check(r1 > 1500 and r2 < 1500,
+          f"update_ratings: winner {r1:.1f} ↑  loser {r2:.1f} ↓")
+    check(abs((r1 - 1500) + (r2 - 1500)) < 0.001,
+          "ELO is zero-sum (winner gain = loser loss)")
+
+    # ── Seed synthetic match data ────────────────────────────────
+    _seed_synthetic_matches(db)
+
+    # ── Overall ELO computation ──────────────────────────────────
+    print(f"\n  [{INFO}] Computing CS2 overall ELOs from seeded matches…")
+    ratings = elo.compute_overall_elos("cs2", force=True)
+    check(len(ratings) >= 2, f"ELO computed for {len(ratings)} teams")
+    check("hltv_teamA" in ratings, "Team A has ELO rating")
+    check("hltv_teamB" in ratings, "Team B has ELO rating")
+
+    # After 10 wins for A vs B (equal K), A should be above 1500
+    check(ratings.get("hltv_teamA", 1500) > 1500,
+          f"Dominant team ELO above 1500 (got {ratings.get('hltv_teamA', 0):.1f})")
+    check(ratings.get("hltv_teamB", 1500) < 1500,
+          f"Losing team ELO below 1500 (got {ratings.get('hltv_teamB', 0):.1f})")
+
+    # ── Map ELO ──────────────────────────────────────────────────
+    _seed_map_stats(db)
+    elo.compute_map_elos("cs2")
+
+    map_elo = elo.get_team_elo("hltv_teamA", "cs2", "Mirage")
+    overall  = elo.get_team_elo("hltv_teamA", "cs2", "overall")
+    check(map_elo != overall,
+          f"Mirage ELO ({map_elo:.1f}) differs from overall ({overall:.1f})")
+    check(map_elo > overall,
+          "Mirage ELO > overall (seeded 70% win rate on Mirage)")
+
+    # ── Map strengths report ─────────────────────────────────────
+    strengths = elo.team_map_strengths("hltv_teamA", "cs2")
+    check(len(strengths) == 7, f"Map strengths returned {len(strengths)} maps (expected 7)")
+    # Mirage (70% wr) should rank first
+    check(strengths[0]["map"] == "Mirage",
+          f"Strongest map is Mirage (got {strengths[0]['map']})")
+    print(f"\n  Team A — map strengths:")
+    for m in strengths:
+        star = "★" if m["map"] == "Mirage" else " "
+        print(f"    {star} {m['map']:12s}  ELO={m['elo']:6.1f}  "
+              f"Δ={m['delta_vs_overall']:+6.1f}  n={m['matches']:3d}  "
+              f"{'✓' if m['reliable'] else '·'}")
+
+    # ── Map-weighted prediction (veto known) ─────────────────────
+    pred_overall = elo.predict_match("hltv_teamA", "hltv_teamB", "cs2")
+    pred_veto    = elo.predict_match(
+        "hltv_teamA", "hltv_teamB", "cs2", veto_maps=["Mirage", "Inferno"]
+    )
+    check(pred_veto["elo_source"] == "map_weighted",
+          f"Veto-aware prediction uses 'map_weighted' (got '{pred_veto['elo_source']}')")
+    check(len(pred_veto["map_breakdown"]) == 2,
+          f"Map breakdown has 2 entries (got {len(pred_veto['map_breakdown'])})")
+    check(pred_veto["win_prob_team1"] != pred_overall["win_prob_team1"],
+          f"Map-weighted P ({pred_veto['win_prob_team1']:.4f}) differs from "
+          f"overall P ({pred_overall['win_prob_team1']:.4f})")
+
+    print(f"\n  Overall prediction:     P(T1)={pred_overall['win_prob_team1']:.4f}  "
+          f"ELO diff={pred_overall['elo_diff']:+.1f}")
+    print(f"  Map-weighted (Mirage+Inferno): P(T1)={pred_veto['win_prob_team1']:.4f}")
+    for mb in pred_veto["map_breakdown"]:
+        print(f"    {mb['map']:10s}  T1={mb['elo1']:.1f}  T2={mb['elo2']:.1f}  "
+              f"P(T1)={mb['prob_team1']:.4f}")
+
+    # ── ELO rankings ────────────────────────────────────────────
+    rankings = elo.elo_rankings("cs2", top_n=5)
+    check(len(rankings) > 0, f"ELO rankings returned {len(rankings)} entries")
+
+    return ratings
+
+
+def _seed_synthetic_matches(db: BotDStorage):
+    """
+    Seed cs2_matches: Team A beats Team B 7 times, Team B wins 3 times.
+    Uses dates going back 6 months so recency decay is exercised.
+    """
+    from datetime import datetime, timedelta
+    base = datetime.utcnow() - timedelta(days=180)
+    rows = []
+    for i in range(10):
+        dt = (base + timedelta(days=i * 18)).strftime("%Y-%m-%d")
+        a_wins = i < 7  # first 7 matches: A wins
+        rows.append({
+            "match_id":       f"syn_{i:03d}",
+            "team1_id":       "hltv_teamA",
+            "team2_id":       "hltv_teamB",
+            "team1_name":     "Team A",
+            "team2_name":     "Team B",
+            "team1_score":    2 if a_wins else 1,
+            "team2_score":    1 if a_wins else 2,
+            "winner_id":      "hltv_teamA" if a_wins else "hltv_teamB",
+            "tournament":     "Test ESL Cup",
+            "tournament_tier":"A",
+            "match_format":   "Bo3",
+            "match_date":     dt,
+        })
+    for r in rows:
+        db.upsert_cs2_match(r)
+
+
+def _seed_map_stats(db: BotDStorage):
+    """
+    Seed cs2_map_stats: Team A has 70% on Mirage, 45% on Inferno (weak map).
+    Team B has 55% on Mirage, 65% on Inferno.
+    """
+    entries = [
+        dict(team_id="hltv_teamA", map_name="Mirage",   wins=35, losses=15, win_rate=0.70, ct_win_rate=0.72, t_win_rate=0.68),
+        dict(team_id="hltv_teamA", map_name="Inferno",  wins=18, losses=22, win_rate=0.45, ct_win_rate=0.44, t_win_rate=0.46),
+        dict(team_id="hltv_teamA", map_name="Nuke",     wins=22, losses=18, win_rate=0.55, ct_win_rate=0.58, t_win_rate=0.52),
+        dict(team_id="hltv_teamA", map_name="Ancient",  wins=20, losses=20, win_rate=0.50, ct_win_rate=0.50, t_win_rate=0.50),
+        dict(team_id="hltv_teamA", map_name="Anubis",   wins=12, losses=8,  win_rate=0.60, ct_win_rate=0.62, t_win_rate=0.58),
+        dict(team_id="hltv_teamA", map_name="Dust2",    wins=15, losses=25, win_rate=0.375,ct_win_rate=0.38, t_win_rate=0.37),
+        dict(team_id="hltv_teamA", map_name="Vertigo",  wins=10, losses=10, win_rate=0.50, ct_win_rate=0.50, t_win_rate=0.50),
+        dict(team_id="hltv_teamB", map_name="Mirage",   wins=27, losses=23, win_rate=0.54, ct_win_rate=0.55, t_win_rate=0.53),
+        dict(team_id="hltv_teamB", map_name="Inferno",  wins=32, losses=18, win_rate=0.64, ct_win_rate=0.66, t_win_rate=0.62),
+        dict(team_id="hltv_teamB", map_name="Nuke",     wins=24, losses=26, win_rate=0.48, ct_win_rate=0.47, t_win_rate=0.49),
+        dict(team_id="hltv_teamB", map_name="Ancient",  wins=20, losses=20, win_rate=0.50, ct_win_rate=0.50, t_win_rate=0.50),
+        dict(team_id="hltv_teamB", map_name="Anubis",   wins=8,  losses=12, win_rate=0.40, ct_win_rate=0.40, t_win_rate=0.40),
+        dict(team_id="hltv_teamB", map_name="Dust2",    wins=28, losses=12, win_rate=0.70, ct_win_rate=0.71, t_win_rate=0.69),
+        dict(team_id="hltv_teamB", map_name="Vertigo",  wins=15, losses=15, win_rate=0.50, ct_win_rate=0.50, t_win_rate=0.50),
+    ]
+    for e in entries:
+        db.upsert_cs2_map_stats(e)
+
+
+# ------------------------------------------------------------------
+# Test 9: ELO signal engine (situational adjustments)
+# ------------------------------------------------------------------
+
+def test_elo_signals(upcoming_matches: list, offline: bool = False):
+    section("Test 9: ELO Signal Engine + Situational Adjustments")
+    db = BotDStorage(TEST_DB)
+
+    # Ensure we have matches to evaluate
+    if not upcoming_matches:
+        # Fallback to what test_signals() already seeded
+        upcoming_matches = db.get_upcoming_matches(days=7)
+
+    now = datetime.utcnow()
+    if not upcoming_matches:
+        print(f"  [{INFO}] No upcoming matches available — seeding for ELO signal test")
+        m = {
+            "match_id": "elo_test_cs2_001",
+            "game": "cs2",
+            "team1": "Team A",
+            "team2": "Team B",
+            "team1_id": "hltv_teamA",
+            "team2_id": "hltv_teamB",
+            "match_datetime": (now + timedelta(hours=3)).strftime("%Y-%m-%d %H:%M:%S"),
+            "tournament": "Test ESL Cup",
+            "tournament_tier": "A",
+            "match_format": "Bo3",
+            "prize_pool": "$200,000",
+            "stream_url": "",
+            "updated_at": db.now(),
+        }
+        db.upsert_upcoming_match(m)
+        upcoming_matches = [m]
+
+    # Always seed a match with known veto for map-weighted test
+    veto_match = {
+        "match_id": "elo_test_cs2_veto",
+        "game": "cs2",
+        "team1": "Team A",
+        "team2": "Team B",
+        "team1_id": "hltv_teamA",
+        "team2_id": "hltv_teamB",
+        "match_datetime": (now + timedelta(hours=4)).strftime("%Y-%m-%d %H:%M:%S"),
+        "tournament": "Test ESL Cup",
+        "tournament_tier": "A",
+        "match_format": "Bo3",
+        "prize_pool": "$200,000",
+        "stream_url": "",
+        "veto_maps": ["Mirage", "Nuke", "Inferno"],  # map veto known!
+        "updated_at": db.now(),
+    }
+    db.upsert_upcoming_match(veto_match)
+
+    engine = EloSignalEngine(TEST_DB)
+    print("  Generating ELO signals…")
+    signals = engine.get_signals()
+    check(True, f"EloSignalEngine produced {len(signals)} signals without error")
+
+    edge_signals = [s for s in signals if s.has_edge]
+    check(True, f"Signals with edge (≥8%): {len(edge_signals)}")
+
+    # Find the veto-aware signal
+    veto_sig = next(
+        (s for s in signals
+         if "veto_maps" in (s.signal_components or {})
+         and s.signal_components["veto_maps"]),
+        None
+    )
+    if veto_sig:
+        check(True, "Map-veto signal found in output")
+        check(
+            veto_sig.signal_components.get("elo_source") == "map_weighted",
+            f"Veto signal uses map_weighted ELO "
+            f"(got '{veto_sig.signal_components.get('elo_source')}')"
+        )
+    else:
+        print(f"  [{INFO}] No map-veto signal found (veto data may not have been picked up)")
+
+    # ── Print full signal table ──────────────────────────────────
+    if signals:
+        print(f"\n  {'─'*85}")
+        print(f"  {'Game':5s} {'Match':30s} {'ELO-diff':9s} {'P(T1)':7s} "
+              f"{'Mkt':6s} {'Side':5s} {'Edge':7s} {'Kelly':6s}")
+        print(f"  {'─'*85}")
+        for s in signals:
+            c = s.signal_components or {}
+            elo_d = c.get("elo_diff_adj", c.get("elo_diff", "?"))
+            elo_str = f"{elo_d:+.1f}" if isinstance(elo_d, (int, float)) else str(elo_d)
+            print(
+                f"  {s.game.upper():5s} "
+                f"{s.team_a[:14]:14s} vs {s.team_b[:13]:13s}  "
+                f"{elo_str:>9s}  "
+                f"{s.p_a:.4f}  {s.market_yes_price:5.1f}  "
+                f"{s.recommended_side:5s}  "
+                f"{max(s.edge_yes,s.edge_no):+.4f}  "
+                f"{s.recommended_kelly:.4f}"
+            )
+
+        # ── Full breakdown for the highest-Kelly signal ──────────
+        if edge_signals:
+            best = max(edge_signals, key=lambda s: s.recommended_kelly)
+            print(f"\n  {'━'*60}")
+            print(f"  FULL SIGNAL BREAKDOWN")
+            print(f"  {'━'*60}")
+            for line in best.reasoning.split("\n"):
+                print(f"  {line}")
+
+            print(f"\n  KALSHI POSITION")
+            print(f"  Team A wins:  {best.team_a}")
+            print(f"  Side:         {best.recommended_side}")
+            print(f"  Market price: {best.market_yes_price:.1f}¢")
+            print(f"  Edge:         {best.edge_yes:+.4f}")
+            print(f"  Kelly stake:  {best.recommended_kelly:.4f} of bankroll")
+            print(f"  Confidence:   {best.confidence:.1%}")
+
+            print(f"\n  SIGNAL COMPONENTS")
+            for k, v in (best.signal_components or {}).items():
+                if isinstance(v, dict):
+                    print(f"  {k}:")
+                    for kk, vv in v.items():
+                        print(f"      {kk}: {vv}")
+                elif isinstance(v, list):
+                    print(f"  {k}: {v}")
+                elif isinstance(v, float):
+                    bar = "█" * int(abs(v) / max(abs(v), 1) * 15)
+                    print(f"  {k:<22s} {v:+.4f}  |{bar}|")
+                else:
+                    print(f"  {k:<22s} {v}")
+
+    return signals
+
+
+# ------------------------------------------------------------------
+# Test 10: Kelly sizing sanity check
 # ------------------------------------------------------------------
 
 def test_kelly():
-    section("Test 8: Kelly Sizing Sanity Check")
+    section("Test 10: Kelly Sizing Sanity Check")
 
     # Case 1: 60% edge on a 50-cent market
     k = half_kelly(0.60, 50.0, fraction=0.5)
@@ -500,6 +799,7 @@ def main():
     results = {}
 
     results["schema"] = test_schema()
+    elo_ratings = test_elo_engine()
     test_kelly()
 
     upcoming = test_liquipedia_upcoming(offline=args.offline)
@@ -509,6 +809,7 @@ def main():
     test_team_stats_population(upcoming, offline=args.offline)
     test_match_snapshot(upcoming)
     signals = test_signals(upcoming, offline=args.offline)
+    elo_signals = test_elo_signals(upcoming, offline=args.offline)
 
     # Summary
     section("PIPELINE SUMMARY")
@@ -521,8 +822,11 @@ def main():
     print(f"  Val matches:         {db.scalar('SELECT COUNT(*) FROM val_matches') or 0}")
     print(f"  Upcoming matches:    {db.scalar('SELECT COUNT(*) FROM liq_upcoming_matches') or 0}")
     print(f"  Tournaments:         {db.scalar('SELECT COUNT(*) FROM liq_tournaments') or 0}")
-    print(f"  Signals generated:   {len(signals)}")
-    print(f"  Signals with edge:   {sum(1 for s in signals if s.has_edge)}")
+    print(f"  ELO teams rated:     {db.scalar('SELECT COUNT(DISTINCT team_id) FROM elo_team_ratings') or 0}")
+    print(f"  ELO signal generated:{len(elo_signals)}")
+    print(f"  ELO signals w/ edge: {sum(1 for s in elo_signals if s.has_edge)}")
+    print(f"  Legacy signals:      {len(signals)}")
+    print(f"  Legacy w/ edge:      {sum(1 for s in signals if s.has_edge)}")
     print()
 
     if args.offline:

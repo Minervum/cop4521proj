@@ -22,7 +22,8 @@ from botd.config import (
     VLR_REFRESH_INTERVAL,
     LIQUIPEDIA_REFRESH_INTERVAL,
 )
-from botd.signals import EsportsSignalEngine
+from botd.engine.signals import EloSignalEngine      # primary ELO engine
+from botd.signals import EsportsSignalEngine          # legacy weight-blend (kept for comparison)
 from botd.data.hltv import HLTVScraper
 from botd.data.vlr import VLRScraper
 from botd.data.liquipedia import LiquipediaScraper
@@ -47,7 +48,7 @@ class BotD:
 
     def __init__(self, db_path: str = DB_PATH):
         self.db = BotDStorage(db_path)
-        self.signal_engine = EsportsSignalEngine(db_path)
+        self.signal_engine = EloSignalEngine(db_path)    # two-layer ELO engine
         self.trader = PaperTrader(self.BOT_ID, db_path, PAPER_BANKROLL)
         self.hltv = HLTVScraper(db_path)
         self.vlr = VLRScraper(db_path)

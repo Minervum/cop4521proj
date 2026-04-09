@@ -97,9 +97,9 @@ class EsportsSignalEngine(BaseSignalEngine):
 
     def _signals_for_game(self, game: str) -> list[Signal]:
         """Generate signals for all upcoming matches in one game."""
-        # Check cache first — if we have fresh data, skip the network fetch
+        # Use cached data if available; only fetch from network when cache is empty
         cached = self.db.get_upcoming_matches(game, days=7)
-        if cached and self.db.is_fresh("liq_upcoming_matches", where=f"game='{game}'", max_age_hours=0.5):
+        if cached:
             upcoming = cached
         else:
             upcoming = self.liq.sync_upcoming_matches(game, days=7)
