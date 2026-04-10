@@ -411,6 +411,29 @@ CREATE INDEX IF NOT EXISTS idx_lol_matches_t1      ON lol_matches(team1_id);
 CREATE INDEX IF NOT EXISTS idx_lol_matches_t2      ON lol_matches(team2_id);
 CREATE INDEX IF NOT EXISTS idx_liq_upcoming_dt     ON liq_upcoming_matches(match_datetime);
 CREATE INDEX IF NOT EXISTS idx_liq_upcoming_game   ON liq_upcoming_matches(game);
+
+-- ============================================================
+-- Tournament context state
+-- ============================================================
+
+CREATE TABLE IF NOT EXISTS tournament_state (
+    tournament_name  TEXT NOT NULL,
+    game             TEXT NOT NULL,
+    stage            TEXT NOT NULL DEFAULT 'unknown',
+    -- 'group' | 'playoffs' | 'grand_final' | 'qualifier' | 'unknown'
+    team_name        TEXT NOT NULL,
+    team_id          TEXT NOT NULL DEFAULT '',
+    bracket_status   TEXT NOT NULL DEFAULT 'playing',
+    -- 'must_win' | 'clinched' | 'eliminated' | 'playing'
+    wins             INTEGER DEFAULT 0,
+    losses           INTEGER DEFAULT 0,
+    position         INTEGER,
+    updated_at       TEXT NOT NULL,
+    PRIMARY KEY (game, tournament_name, team_name)
+);
+
+CREATE INDEX IF NOT EXISTS idx_tournament_state_game   ON tournament_state(game);
+CREATE INDEX IF NOT EXISTS idx_tournament_state_status ON tournament_state(bracket_status);
 """
 
 
@@ -713,3 +736,35 @@ class BotDStorage(BaseStorage):
                 except (json.JSONDecodeError, TypeError):
                     row["veto_maps"] = []
         return rows
+
+    # ------------------------------------------------------------------
+    # Tournament context state helpers
+    # ------------------------------------------------------------------
+
+    def upsert_tournament_state(self, state: dict):
+        state = dict(state)
+        state.setdefault("updated_at", self.now())
+        self.upsert("tournament_state", state, ["game", "tournament_name", "team_name"])
+
+    def get_team_tournament_state(self, team_name: str, game: str) -> dict | None:
+        """Lookup a team's bracket status in the most-recently-updated tournament."""
+        rows = self.execute(
+            "SELECT * FROM tournament_state "
+            "WHERE game=? AND LOWER(team_name) LIKE ? "
+            "ORDER BY updated_at DESC LIMIT 1",
+            (game, f"%{team_name[:20].lower()}%"),
+        )
+        return rows[0] if rows else None
+
+    def get_active_tournament_states(self, game: str | None = None) -> list[dict]:
+        """Return all tournament_state rows, optionally filtered by game."""
+        if game:
+            return self.execute(
+                "SELECT * FROM tournament_state WHERE game=? "
+                "ORDER BY game, tournament_name, bracket_status, team_name",
+                (game,),
+            )
+        return self.execute(
+            "SELECT * FROM tournament_state "
+            "ORDER BY game, tournament_name, bracket_status, team_name"
+        )

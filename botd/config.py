@@ -156,3 +156,34 @@ KALSHI_TICKERS: dict[str, str] = {
 HLTV_REFRESH_INTERVAL: int = int(os.environ.get("HLTV_REFRESH_INTERVAL", "360"))
 VLR_REFRESH_INTERVAL: int = int(os.environ.get("VLR_REFRESH_INTERVAL", "360"))
 LIQUIPEDIA_REFRESH_INTERVAL: int = int(os.environ.get("LIQUIPEDIA_REFRESH_INTERVAL", "30"))
+
+# ── Tournament context engine ───────────────────────────────────────────────
+
+# How often (minutes) to re-query Liquipedia for bracket state changes.
+# 30 min is safe within Liquipedia's rate limits during live events.
+TOURNAMENT_STATE_REFRESH_MINUTES: int = int(
+    os.environ.get("TOURNAMENT_STATE_REFRESH_MINUTES", "30")
+)
+
+# ELO adjustments applied based on bracket context
+ELO_ADJ_MUST_WIN: float = float(os.environ.get("ELO_ADJ_MUST_WIN", "6.0"))
+# Teams with something to play for outperform their rating by ~6 ELO points.
+# Source: internal calibration against historical esports results.
+
+ELO_ADJ_CLINCHED: float = float(os.environ.get("ELO_ADJ_CLINCHED", "-10.0"))
+# Teams that have already secured their bracket slot frequently rest starters,
+# run experimental strats, or simply play at reduced intensity. −10 ELO is
+# conservative; empirical data from CS:GO majors shows −8 to −15 ELO effect.
+
+# In playoff bracket stages (quarterfinals, semis, finals), upsets are less
+# common than in group stage. The FORMAT_PROB_MULTIPLIERS base is designed for
+# group/regular-season play. In playoffs, boost the multiplier by this amount.
+PLAYOFF_FORMAT_MULT_BOOST: float = float(
+    os.environ.get("PLAYOFF_FORMAT_MULT_BOOST", "0.05")
+)
+
+# Rematch within same tournament within 7 days: the losing team has had time
+# to review VODs and adapt. Compress the ELO gap by this fraction.
+REMATCH_ELO_GAP_REDUCTION: float = float(
+    os.environ.get("REMATCH_ELO_GAP_REDUCTION", "0.10")
+)

@@ -101,6 +101,7 @@ _SCRAPER_MODULES: dict[str, str] = {
     "lol":   "botd.data.lol",
 }
 from botd.engine.elo import EloEngine
+from botd.engine.tournament_context import TournamentContextEngine
 from botd.storage.db import BotDStorage
 
 logger = logging.getLogger(__name__)
@@ -177,6 +178,7 @@ class EloSignalEngine(BaseSignalEngine):
     def __init__(self, db_path: str = DB_PATH):
         self.db = BotDStorage(db_path)
         self.elo = EloEngine(db_path)
+        self.tournament_ctx = TournamentContextEngine(db_path)
 
     @property
     def bot_id(self) -> str:
@@ -328,6 +330,16 @@ class EloSignalEngine(BaseSignalEngine):
                 self._region_adj(t1_id, t2_id, match.get("tournament", ""))
             )
 
+        # ── Tournament context (must-win / clinched / rematch) ────────
+        ctx = self.tournament_ctx.get_match_context(
+            match, t1_id, t2_id, t1_name, t2_name, game
+        )
+        adjustments.extend(
+            self.tournament_ctx.get_elo_adjustments(
+                ctx, t1_name, t2_name, elo1, elo2
+            )
+        )
+
         # ── Step 3: Apply adjustments ────────────────────────────────
         total_adj1 = sum(a.team1_delta for a in adjustments)
         total_adj2 = sum(a.team2_delta for a in adjustments)
@@ -337,8 +349,13 @@ class EloSignalEngine(BaseSignalEngine):
         # ── Step 4: Win probability from adjusted ELOs ───────────────
         p_raw = self.elo.expected_score(elo1_adj, elo2_adj)
 
-        # ── Step 5: Format multiplier ─────────────────────────────────
-        fmt_mult = FORMAT_PROB_MULTIPLIERS.get(match_format, 1.0)
+        # ── Step 5: Format multiplier + playoff stage boost ───────────
+        # In playoff brackets, upsets are rarer → boost the multiplier
+        # so the favourite's probability is pushed further from 50%.
+        fmt_mult = round(
+            FORMAT_PROB_MULTIPLIERS.get(match_format, 1.0) + ctx.playoff_mult_boost,
+            3,
+        )
         p_final = max(0.05, min(0.95, 0.5 + (p_raw - 0.5) * fmt_mult))
 
         confidence = self._compute_confidence(
@@ -351,6 +368,7 @@ class EloSignalEngine(BaseSignalEngine):
             match.get("tournament", ""), match.get("tournament_tier", "C"),
             elo1, elo2, total_adj1, total_adj2, elo1_adj, elo2_adj,
             p_raw, p_final, fmt_mult, adjustments, base, veto_maps, match_type,
+            ctx.stage,
         )
 
         return EloMatchPrediction(
@@ -863,15 +881,17 @@ def _build_reasoning(
     base_result: dict,
     veto_maps: list[str],
     match_type: str,
+    stage: str = "unknown",
 ) -> str:
     W = 60
     sep  = "─" * W
     dsep = "═" * W
 
+    stage_label = f"  •  {stage.upper()}" if stage and stage != "unknown" else ""
     lines = [
         dsep,
         f"  {game.upper()} | {t1_name} vs {t2_name}",
-        f"  {match_format}  •  Tier {tier}  •  {match_type.upper()}",
+        f"  {match_format}  •  Tier {tier}  •  {match_type.upper()}{stage_label}",
         f"  {tournament}",
         sep,
         "",
@@ -914,7 +934,9 @@ def _build_reasoning(
         "",
         "  PROBABILITY",
         f"  P(T1 wins) from adjusted ELO : {p_raw:.4f}  ({p_raw:.1%})",
-        f"  Format multiplier [{match_format}]       : ×{fmt_mult:.2f}",
+        f"  Format multiplier [{match_format}]       : ×{fmt_mult:.3f}"
+        + (f"  (+{fmt_mult - FORMAT_PROB_MULTIPLIERS.get(match_format, 1.0):.3f} playoff boost)"
+           if stage in ("playoffs", "grand_final") else ""),
         f"  P(T1 wins) FINAL             : {p_final:.4f}  ({p_final:.1%})",
         dsep,
     ]

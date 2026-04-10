@@ -165,6 +165,24 @@ class BotD:
             time.sleep(30)
 
     # ------------------------------------------------------------------
+    # Tournament context
+    # ------------------------------------------------------------------
+
+    def tournament_state(self) -> str:
+        """
+        Show active tournament bracket states and exploitable upcoming matches.
+
+        Seeds tournament_state from existing liq_brackets data (populated
+        during normal data syncs).  Run 'botd sync' first for live data.
+        """
+        ctx_engine = self.signal_engine.tournament_ctx
+        for game in ("cs2", "val", "dota2", "lol"):
+            seeded = ctx_engine.ingest_from_liq_brackets(game)
+            if seeded:
+                logger.debug("Seeded %d tournament_state rows for %s", seeded, game)
+        return ctx_engine.tournament_dashboard()
+
+    # ------------------------------------------------------------------
     # Reporting
     # ------------------------------------------------------------------
 
@@ -216,6 +234,10 @@ def main():
     sub.add_parser("loop", help="Run continuous scheduled loop")
     sub.add_parser("sync", help="Force full data sync")
     sub.add_parser("status", help="Print bot status")
+    sub.add_parser(
+        "tournament-state",
+        help="Show active tournament bracket context and exploitable matches",
+    )
 
     args = parser.parse_args()
     bot = BotD()
@@ -226,6 +248,8 @@ def main():
         bot.full_sync()
     elif args.command == "status":
         print(json.dumps(bot.status(), indent=2))
+    elif args.command == "tournament-state":
+        print(bot.tournament_state())
     else:
         result = bot.run_once()
         print(json.dumps(result, indent=2))
