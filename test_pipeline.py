@@ -780,6 +780,199 @@ def test_kelly():
 
 
 # ------------------------------------------------------------------
+# Test 11: Combined 4-game signal scan
+# ------------------------------------------------------------------
+
+def _seed_dota2_data(db: BotDStorage):
+    """Seed synthetic Dota2 match + hero data for offline test."""
+    from datetime import datetime, timedelta
+    now = datetime.utcnow()
+    # Two teams with match history
+    db.upsert_dota2_team({"team_id": "dota2_teamA", "name": "Team Spirit", "ranking": 1,
+                          "country": "RU", "region": "EU", "wins": 70, "losses": 30, "rating": 2000.0})
+    db.upsert_dota2_team({"team_id": "dota2_teamB", "name": "Team Liquid", "ranking": 2,
+                          "country": "NL", "region": "EU", "wins": 60, "losses": 40, "rating": 1800.0})
+    # 6 months of match history (Team A wins 7/10)
+    base = now - timedelta(days=180)
+    for i in range(10):
+        dt = (base + timedelta(days=i * 18)).strftime("%Y-%m-%d")
+        a_wins = i < 7
+        db.upsert_dota2_match({
+            "match_id": f"dota2_syn_{i:03d}",
+            "team1_id": "dota2_teamA", "team2_id": "dota2_teamB",
+            "team1_name": "Team Spirit", "team2_name": "Team Liquid",
+            "team1_score": 2 if a_wins else 1, "team2_score": 1 if a_wins else 2,
+            "winner_id": "dota2_teamA" if a_wins else "dota2_teamB",
+            "tournament": "ESL One Dota2", "tournament_tier": "A",
+            "match_format": "Bo3", "match_date": dt,
+        })
+    # Hero stats for draft advantage test (Team A: diverse pool)
+    heroes_a = ["Pudge", "Invoker", "Earthshaker", "Puck", "Storm Spirit",
+                 "Magnus", "Enigma", "Tidehunter", "Leshrac", "Rubick",
+                 "Anti-Mage", "Phantom Lancer", "Juggernaut", "Medusa", "Broodmother",
+                 "Windranger", "Faceless Void", "Terrorblade", "Templar Assassin", "Tinker"]
+    for j, hero in enumerate(heroes_a):
+        db.upsert_dota2_hero_stats({
+            "team_id": "dota2_teamA", "hero_name": hero,
+            "times_picked": 15, "times_banned": 5, "wins": 9, "losses": 6,
+            "win_rate": 0.60,
+        })
+    # Upcoming match
+    db.upsert_upcoming_match({
+        "match_id": "dota2_test_001", "game": "dota2",
+        "team1": "Team Spirit", "team2": "Team Liquid",
+        "team1_id": "dota2_teamA", "team2_id": "dota2_teamB",
+        "match_datetime": (now + timedelta(hours=5)).strftime("%Y-%m-%d %H:%M:%S"),
+        "tournament": "ESL One Dota2", "tournament_tier": "A",
+        "match_format": "Bo3", "prize_pool": "$500,000", "stream_url": "",
+    })
+
+
+def _seed_lol_data(db: BotDStorage):
+    """Seed synthetic LoL match + position data for offline test."""
+    from datetime import datetime, timedelta
+    now = datetime.utcnow()
+    db.upsert_lol_team({"team_id": "lol_t1", "name": "T1", "code": "T1",
+                        "ranking": 1, "region": "KR", "league": "LCK",
+                        "wins": 18, "losses": 2})
+    db.upsert_lol_team({"team_id": "lol_c9", "name": "Cloud9", "code": "C9",
+                        "ranking": 2, "region": "NA", "league": "LCS",
+                        "wins": 10, "losses": 10})
+    # Match history
+    base = now - timedelta(days=60)
+    for i in range(8):
+        dt = (base + timedelta(days=i * 7)).strftime("%Y-%m-%d")
+        t1_wins = i < 6
+        db.upsert_lol_match({
+            "match_id": f"lol_syn_{i:03d}",
+            "team1_id": "lol_t1", "team2_id": "lol_c9",
+            "team1_name": "T1", "team2_name": "Cloud9",
+            "team1_score": 2 if t1_wins else 0, "team2_score": 0 if t1_wins else 2,
+            "winner_id": "lol_t1" if t1_wins else "lol_c9",
+            "tournament": "Worlds 2025", "tournament_tier": "S",
+            "match_format": "Bo5", "match_date": dt,
+        })
+    # Position stats for T1
+    for pos, wr in [("top", 0.65), ("jungle", 0.72), ("mid", 0.80),
+                    ("bot", 0.70), ("support", 0.60)]:
+        db.upsert_lol_position_stats({
+            "team_id": "lol_t1", "position": pos,
+            "wins": int(wr * 20), "losses": int((1 - wr) * 20), "win_rate": wr,
+        })
+    # Upcoming match (international → region adj applies)
+    db.upsert_upcoming_match({
+        "match_id": "lol_test_001", "game": "lol",
+        "team1": "T1", "team2": "Cloud9",
+        "team1_id": "lol_t1", "team2_id": "lol_c9",
+        "match_datetime": (now + timedelta(hours=6)).strftime("%Y-%m-%d %H:%M:%S"),
+        "tournament": "Worlds 2025", "tournament_tier": "S",
+        "match_format": "Bo5", "prize_pool": "$2,225,000", "stream_url": "",
+    })
+
+
+def test_4game_scan(offline: bool = False):
+    section("Test 11: Combined 4-Game Signal Scan")
+    db = BotDStorage(TEST_DB)
+    now = datetime.utcnow()
+
+    # Seed Dota2 and LoL data (cs2/val already seeded by earlier tests)
+    _seed_dota2_data(db)
+    _seed_lol_data(db)
+
+    # Ensure cs2 match is seeded if not present
+    if not db.get_upcoming_matches("cs2", days=7):
+        db.upsert_upcoming_match({
+            "match_id": "scan_cs2_001", "game": "cs2",
+            "team1": "Team A", "team2": "Team B",
+            "team1_id": "hltv_teamA", "team2_id": "hltv_teamB",
+            "match_datetime": (now + timedelta(hours=2)).strftime("%Y-%m-%d %H:%M:%S"),
+            "tournament": "Test ESL Cup", "tournament_tier": "A",
+            "match_format": "Bo3", "prize_pool": "$200,000", "stream_url": "",
+        })
+
+    engine = EloSignalEngine(TEST_DB)
+    print("  Generating ELO signals across all 4 games...")
+    signals = engine.get_signals()
+
+    by_game: dict[str, list] = {"cs2": [], "val": [], "dota2": [], "lol": []}
+    for s in signals:
+        by_game.setdefault(s.game, []).append(s)
+
+    check(True, f"Total signals generated: {len(signals)}")
+    for game, sigs in by_game.items():
+        edge_count = sum(1 for s in sigs if s.has_edge)
+        check(True, f"  {game.upper():6s}: {len(sigs):2d} signals, {edge_count} with edge ≥8%")
+
+    # Edge distribution
+    edges = [max(abs(s.edge_yes), abs(s.edge_no)) for s in signals]
+    if edges:
+        print(f"\n  Edge distribution:")
+        print(f"    Min:    {min(edges):+.4f}")
+        print(f"    Max:    {max(edges):+.4f}")
+        print(f"    Mean:   {sum(edges)/len(edges):+.4f}")
+        print(f"    Median: {sorted(edges)[len(edges)//2]:+.4f}")
+
+    # Signal scan table
+    print(f"\n  {'─'*100}")
+    print(f"  {'Game':6s} {'Match':33s} {'ELO-diff':9s} {'P(T1)':7s} "
+          f"{'Mkt':6s} {'Side':5s} {'Edge':7s} {'Conf':6s}")
+    print(f"  {'─'*100}")
+    for s in sorted(signals, key=lambda x: max(abs(x.edge_yes), abs(x.edge_no)), reverse=True):
+        c = s.signal_components or {}
+        elo_d = c.get("elo_diff_adj", 0)
+        elo_str = f"{elo_d:+.1f}" if isinstance(elo_d, (int, float)) else "?"
+        edge = max(abs(s.edge_yes), abs(s.edge_no))
+        flag = "★ HIGH CONF" if s.has_edge and s.confidence >= 0.15 else ""
+        print(
+            f"  {s.game.upper():6s} "
+            f"{s.team_a[:15]:15s} vs {s.team_b[:14]:14s}  "
+            f"{elo_str:>9s}  {s.p_a:.4f}  {s.market_yes_price:5.1f}  "
+            f"{s.recommended_side:5s}  {edge:+.4f}  {s.confidence:.2f}  {flag}"
+        )
+
+    # High-confidence signals (edge ≥ 15% or confidence ≥ 0.15 with edge)
+    high_conf = [s for s in signals if s.has_edge and s.confidence >= 0.15]
+    edge_ge15 = [s for s in signals if max(abs(s.edge_yes), abs(s.edge_no)) >= 0.15]
+
+    print(f"\n  {'━'*60}")
+    print(f"  HIGH-CONFIDENCE SIGNALS SUMMARY")
+    print(f"  {'━'*60}")
+    print(f"  Signals with edge ≥ 8%:  {sum(1 for s in signals if s.has_edge)}")
+    print(f"  Signals with edge ≥ 15%: {len(edge_ge15)}")
+    print(f"  Signals confidence ≥ 15%: {len(high_conf)}")
+
+    if high_conf:
+        best = max(high_conf, key=lambda s: s.recommended_kelly)
+        print(f"\n  Best actionable signal:")
+        print(f"    {best.game.upper()}: {best.team_a} vs {best.team_b}")
+        print(f"    Side: {best.recommended_side}  Kelly: {best.recommended_kelly:.4f}")
+        print(f"    Edge: {max(best.edge_yes, best.edge_no):+.4f}  Confidence: {best.confidence:.1%}")
+
+    check(len(signals) >= 3, f"At least 3 signals generated across 4 games (got {len(signals)})")
+    check(len(by_game.get("dota2", [])) >= 1, "Dota 2 signal generated")
+    check(len(by_game.get("lol", [])) >= 1, "LoL signal generated")
+
+    # Verify LoL region adjustment fires for Worlds match
+    lol_sigs = by_game.get("lol", [])
+    if lol_sigs:
+        worlds_sig = next(
+            (s for s in lol_sigs
+             if "worlds" in (s.tournament or "").lower()
+             or "region_adj" in (s.signal_components or {})),
+            None
+        )
+        if worlds_sig:
+            check(
+                "region_adj" in (worlds_sig.signal_components or {}),
+                "LoL Worlds signal has region_adj component"
+            )
+        else:
+            print(f"  [{INFO}] LoL Worlds region_adj not found in components")
+
+    return signals
+
+
+# ------------------------------------------------------------------
 # Main
 # ------------------------------------------------------------------
 
@@ -810,23 +1003,19 @@ def main():
     test_match_snapshot(upcoming)
     signals = test_signals(upcoming, offline=args.offline)
     elo_signals = test_elo_signals(upcoming, offline=args.offline)
+    all_signals = test_4game_scan(offline=args.offline)
 
     # Summary
     section("PIPELINE SUMMARY")
     db = BotDStorage(TEST_DB)
-    print(f"  CS2 teams:           {db.scalar('SELECT COUNT(*) FROM cs2_teams') or 0}")
-    print(f"  CS2 matches:         {db.scalar('SELECT COUNT(*) FROM cs2_matches') or 0}")
-    print(f"  CS2 map stats:       {db.scalar('SELECT COUNT(*) FROM cs2_map_stats') or 0}")
-    print(f"  CS2 player stats:    {db.scalar('SELECT COUNT(*) FROM cs2_player_stats') or 0}")
-    print(f"  Val teams:           {db.scalar('SELECT COUNT(*) FROM val_teams') or 0}")
-    print(f"  Val matches:         {db.scalar('SELECT COUNT(*) FROM val_matches') or 0}")
+    for game in ("cs2", "val", "dota2", "lol"):
+        print(f"  {game.upper():6s} teams:   {db.scalar(f'SELECT COUNT(*) FROM {game}_teams') or 0}")
+        print(f"  {game.upper():6s} matches: {db.scalar(f'SELECT COUNT(*) FROM {game}_matches') or 0}")
     print(f"  Upcoming matches:    {db.scalar('SELECT COUNT(*) FROM liq_upcoming_matches') or 0}")
-    print(f"  Tournaments:         {db.scalar('SELECT COUNT(*) FROM liq_tournaments') or 0}")
     print(f"  ELO teams rated:     {db.scalar('SELECT COUNT(DISTINCT team_id) FROM elo_team_ratings') or 0}")
-    print(f"  ELO signal generated:{len(elo_signals)}")
-    print(f"  ELO signals w/ edge: {sum(1 for s in elo_signals if s.has_edge)}")
+    print(f"  4-game signals:      {len(all_signals)}")
+    print(f"  4-game with edge:    {sum(1 for s in all_signals if s.has_edge)}")
     print(f"  Legacy signals:      {len(signals)}")
-    print(f"  Legacy w/ edge:      {sum(1 for s in signals if s.has_edge)}")
     print()
 
     if args.offline:

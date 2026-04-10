@@ -63,7 +63,43 @@ from botd.config import (
     FORMAT_PROB_MULTIPLIERS,
     KELLY_FRACTION,
     MAX_POSITION_FRACTION,
+    DOTA2_DRAFT_ADJ_SCALE,
+    DOTA2_HERO_POOL_TARGET,
+    LOL_REGION_ELO_ADJ,
+    LOL_INTERNATIONAL_KEYWORDS,
 )
+
+# Routing: game → roster change table
+_ROSTER_TABLES: dict[str, str] = {
+    "cs2":   "cs2_roster_changes",
+    "val":   "val_roster_changes",
+    "dota2": "dota2_roster_changes",
+    "lol":   "lol_roster_changes",
+}
+
+# Routing: game → match history table (for travel fatigue, confidence)
+_MATCH_TABLES: dict[str, str] = {
+    "cs2":   "cs2_matches",
+    "val":   "val_matches",
+    "dota2": "dota2_matches",
+    "lol":   "lol_matches",
+}
+
+# Routing: game → team table (for region lookup in LoL)
+_TEAM_TABLES: dict[str, str] = {
+    "cs2":   "cs2_teams",
+    "val":   "val_teams",
+    "dota2": "dota2_teams",
+    "lol":   "lol_teams",
+}
+
+# Routing: game → source scraper import path for fallback
+_SCRAPER_MODULES: dict[str, str] = {
+    "cs2":   "botd.data.liquipedia",
+    "val":   "botd.data.liquipedia",
+    "dota2": "botd.data.dota",
+    "lol":   "botd.data.lol",
+}
 from botd.engine.elo import EloEngine
 from botd.storage.db import BotDStorage
 
@@ -148,7 +184,7 @@ class EloSignalEngine(BaseSignalEngine):
 
     @property
     def games(self) -> list[str]:
-        return ["cs2", "val"]
+        return ["cs2", "val", "dota2", "lol"]
 
     # ------------------------------------------------------------------
     # BaseSignalEngine interface
@@ -210,9 +246,7 @@ class EloSignalEngine(BaseSignalEngine):
         if cached:
             upcoming = cached
         else:
-            from botd.data.liquipedia import LiquipediaScraper
-            liq = LiquipediaScraper(self.db.db_path)
-            upcoming = liq.sync_upcoming_matches(game, days=7)
+            upcoming = self._fetch_upcoming(game)
 
         if not upcoming:
             logger.debug("No upcoming %s matches found", game)
@@ -286,6 +320,13 @@ class EloSignalEngine(BaseSignalEngine):
             )
         )
         adjustments.append(self._venue_adj(t1_id, t2_id, game, match_type))
+        # Game-specific adjustments
+        if game == "dota2":
+            adjustments.append(self._draft_advantage_adj(t1_id, t2_id))
+        if game == "lol":
+            adjustments.append(
+                self._region_adj(t1_id, t2_id, match.get("tournament", ""))
+            )
 
         # ── Step 3: Apply adjustments ────────────────────────────────
         total_adj1 = sum(a.team1_delta for a in adjustments)
@@ -349,7 +390,7 @@ class EloSignalEngine(BaseSignalEngine):
         Recently signed player:   −3 ELO
         """
         factors: list[AdjustmentFactor] = []
-        roster_table = "cs2_roster_changes" if game == "cs2" else "val_roster_changes"
+        roster_table = _ROSTER_TABLES.get(game, f"{game}_roster_changes")
         cutoff = (datetime.utcnow() - timedelta(days=14)).strftime("%Y-%m-%d")
 
         for team_id, slot in ((t1_id, 1), (t2_id, 2)):
@@ -462,7 +503,7 @@ class EloSignalEngine(BaseSignalEngine):
 
         window_start = (match_dt - timedelta(hours=48)).strftime("%Y-%m-%d")
         window_end   = match_dt.strftime("%Y-%m-%d")
-        match_table  = "cs2_matches" if game == "cs2" else "val_matches"
+        match_table  = _MATCH_TABLES.get(game, f"{game}_matches")
 
         for team_id, slot in ((t1_id, 1), (t2_id, 2)):
             prior = self.db.execute(
@@ -541,6 +582,77 @@ class EloSignalEngine(BaseSignalEngine):
             reason="; ".join(parts) or f"No venue data ({match_type})",
         )
 
+    def _draft_advantage_adj(self, t1_id: str, t2_id: str) -> AdjustmentFactor:
+        """
+        Dota 2 only: adjust for hero pool diversity.
+        A team with a wider signature hero pool is harder to counter via bans.
+
+        Score  = # heroes with ≥ 5 games / DOTA2_HERO_POOL_TARGET
+        Clipped to [0, 1].  Neutral at 0.5 (15 heroes with 5+ games).
+        Delta  = (score − 0.5) × DOTA2_DRAFT_ADJ_SCALE  (±10 ELO max with default 20)
+        """
+        def pool_score(team_id: str) -> float:
+            n = self.db.scalar(
+                "SELECT COUNT(*) FROM dota2_hero_stats "
+                "WHERE team_id=? AND (wins + losses) >= 5",
+                (team_id,),
+            ) or 0
+            return min(1.0, n / DOTA2_HERO_POOL_TARGET)
+
+        s1 = pool_score(t1_id)
+        s2 = pool_score(t2_id)
+        d1 = round((s1 - 0.5) * DOTA2_DRAFT_ADJ_SCALE, 2)
+        d2 = round((s2 - 0.5) * DOTA2_DRAFT_ADJ_SCALE, 2)
+        return AdjustmentFactor(
+            name="draft_advantage",
+            team1_delta=d1,
+            team2_delta=d2,
+            reason=(
+                f"Hero pool: T1={s1:.0%} ({d1:+.1f} ELO) "
+                f"T2={s2:.0%} ({d2:+.1f} ELO)"
+            ),
+        )
+
+    def _region_adj(
+        self, t1_id: str, t2_id: str, tournament_name: str
+    ) -> AdjustmentFactor:
+        """
+        LoL only: apply regional ELO bias for international events.
+
+        Applied when the tournament name contains an international keyword
+        (Worlds, MSI, etc.) AND the two teams come from different regions.
+
+        ELO deltas are tunable via LOL_REGION_ELO_ADJ in config.py.
+        """
+        is_international = any(
+            kw in tournament_name.lower()
+            for kw in LOL_INTERNATIONAL_KEYWORDS
+        )
+        if not is_international:
+            return AdjustmentFactor(
+                name="region_adj", team1_delta=0.0, team2_delta=0.0,
+                reason="Domestic LoL match — no region adjustment",
+            )
+
+        r1 = self._team_region(t1_id, "lol")
+        r2 = self._team_region(t2_id, "lol")
+        if r1 == r2:
+            return AdjustmentFactor(
+                name="region_adj", team1_delta=0.0, team2_delta=0.0,
+                reason=f"Same region ({r1}) — no adjustment",
+            )
+
+        d1 = round(LOL_REGION_ELO_ADJ.get(r1, 0.0), 2)
+        d2 = round(LOL_REGION_ELO_ADJ.get(r2, 0.0), 2)
+        return AdjustmentFactor(
+            name="region_adj",
+            team1_delta=d1,
+            team2_delta=d2,
+            reason=(
+                f"International event: {r1} ({d1:+.0f}) vs {r2} ({d2:+.0f}) ELO"
+            ),
+        )
+
     def _detect_match_type(self, match: dict, game: str) -> str:
         loc = self._tournament_location(match.get("tournament", ""), game)
         return "online" if (not loc or "online" in loc.lower()) else "lan"
@@ -570,7 +682,7 @@ class EloSignalEngine(BaseSignalEngine):
           Each team had a match in last 14 d  → +0.10 each  (max +0.20)
         """
         score = 0.0
-        match_table = "cs2_matches" if game == "cs2" else "val_matches"
+        match_table = _MATCH_TABLES.get(game, f"{game}_matches")
         recent_cutoff = (datetime.utcnow() - timedelta(days=14)).strftime("%Y-%m-%d")
 
         for tid in (t1_id, t2_id):
@@ -698,16 +810,42 @@ class EloSignalEngine(BaseSignalEngine):
     # Utilities
     # ------------------------------------------------------------------
 
+    def _fetch_upcoming(self, game: str) -> list[dict]:
+        """Dispatch to the correct scraper for live upcoming match fetch."""
+        try:
+            if game in ("cs2", "val"):
+                from botd.data.liquipedia import LiquipediaScraper
+                return LiquipediaScraper(self.db.db_path).sync_upcoming_matches(game, days=7)
+            elif game == "dota2":
+                from botd.data.dota import DotaScraper
+                return DotaScraper(self.db.db_path).sync_upcoming_matches(days=7)
+            elif game == "lol":
+                from botd.data.lol import LoLScraper
+                return LoLScraper(self.db.db_path).sync_upcoming_matches(days=7)
+        except Exception as exc:
+            logger.error("Failed to fetch upcoming %s matches: %s", game, exc)
+        return []
+
     def _resolve_team_id(self, team_name: str, game: str) -> str:
-        table = "cs2_teams" if game == "cs2" else "val_teams"
+        table = _TEAM_TABLES.get(game, f"{game}_teams")
         rows = self.db.execute(
             f"SELECT team_id FROM {table} WHERE LOWER(name) LIKE ? LIMIT 1",
             (f"%{team_name[:15].lower()}%",),
         )
         if rows:
             return rows[0]["team_id"]
-        prefix = "hltv_" if game == "cs2" else "vlr_"
+        # Fallback: stable hash-based ID with game prefix
+        prefixes = {"cs2": "hltv_", "val": "vlr_", "dota2": "dota2_", "lol": "lol_"}
+        prefix = prefixes.get(game, f"{game}_")
         return prefix + hashlib.md5(team_name.lower().encode()).hexdigest()[:8]
+
+    def _team_region(self, team_id: str, game: str) -> str:
+        """Lookup team's region from lol_teams or dota2_teams."""
+        table = _TEAM_TABLES.get(game, f"{game}_teams")
+        rows = self.db.execute(
+            f"SELECT region FROM {table} WHERE team_id=?", (team_id,)
+        )
+        return (rows[0].get("region") or "OTHER") if rows else "OTHER"
 
 
 # ---------------------------------------------------------------------------

@@ -52,12 +52,40 @@ from botd.config import (
     DB_PATH,
     CS2_MAP_POOL,
     VAL_MAP_POOL,
+    DOTA2_ROLE_POOL,
+    LOL_POSITION_POOL,
     ELO_INITIAL_RATING,
     ELO_K_FACTORS,
     ELO_RECENCY_DECAY_PER_MONTH,
     ELO_MAP_WIN_RATE_SCALE,
     ELO_MIN_MATCHES_FOR_MAP,
 )
+
+# Routing tables: game → table names
+_MATCH_TABLES: dict[str, str] = {
+    "cs2":   "cs2_matches",
+    "val":   "val_matches",
+    "dota2": "dota2_matches",
+    "lol":   "lol_matches",
+}
+_TEAM_TABLES: dict[str, str] = {
+    "cs2":   "cs2_teams",
+    "val":   "val_teams",
+    "dota2": "dota2_teams",
+    "lol":   "lol_teams",
+}
+_LAYER2_TABLES: dict[str, str] = {
+    "cs2":   "cs2_map_stats",
+    "val":   "val_map_stats",
+    "dota2": "dota2_hero_stats",
+    "lol":   "lol_position_stats",
+}
+_LAYER2_NAME_COL: dict[str, str] = {
+    "cs2":   "map_name",
+    "val":   "map_name",
+    "dota2": "hero_name",
+    "lol":   "position",
+}
 
 logger = logging.getLogger(__name__)
 
@@ -110,13 +138,19 @@ CREATE INDEX IF NOT EXISTS idx_elo_venue_team   ON elo_venue_stats(team_id, game
 
 class EloEngine:
     """
-    Computes and caches two-layer ELO ratings for CS2 and Valorant teams.
+    Computes and caches two-layer ELO ratings for CS2, Valorant, Dota 2,
+    and League of Legends teams.
+
+    The secondary ELO layer is game-specific:
+      CS2:   per-map win rates  → map ELO
+      Val:   per-map win rates  → map ELO
+      Dota2: per-hero win rates → hero ELO (proxy for draft strength)
+      LoL:   per-position stats → position ELO
 
     Typical usage:
         elo = EloEngine()
-        elo.sync("cs2")                              # build all ratings
-        p = elo.predict_match(t1, t2, "cs2").win_prob_team1
-        elo.team_map_strengths(t1, "cs2")            # per-map breakdown
+        elo.sync_all()
+        p = elo.predict_match(t1, t2, "dota2")["win_prob_team1"]
     """
 
     def __init__(self, db_path: str = DB_PATH):
@@ -198,7 +232,7 @@ class EloEngine:
                 return {r["team_id"]: r["rating"] for r in rows}
 
         logger.info("Computing %s overall ELO from full match history", game)
-        table = "cs2_matches" if game == "cs2" else "val_matches"
+        table = _MATCH_TABLES.get(game, f"{game}_matches")
 
         matches = self.db.execute(
             f"SELECT * FROM {table} ORDER BY match_date ASC, created_at ASC"
@@ -206,6 +240,7 @@ class EloEngine:
         if not matches:
             logger.warning("No %s matches found — ELO ratings will be blank", game)
             return {}
+
 
         now = datetime.utcnow()
         ratings: dict[str, float] = {}
@@ -310,37 +345,45 @@ class EloEngine:
         if not overall:
             return
 
-        maps = CS2_MAP_POOL if game == "cs2" else VAL_MAP_POOL
-        map_table = "cs2_map_stats" if game == "cs2" else "val_map_stats"
-        map_stats = self.db.execute(f"SELECT * FROM {map_table}")
+        layer2_table = _LAYER2_TABLES.get(game)
+        name_col     = _LAYER2_NAME_COL.get(game, "map_name")
+        if not layer2_table:
+            return
+
+        # For cs2/val we filter by the fixed map pool; for dota2/lol accept any entry
+        pool: list[str] | None = CS2_MAP_POOL if game == "cs2" else (
+            VAL_MAP_POOL if game == "val" else None
+        )
+
+        map_stats = self.db.execute(f"SELECT * FROM {layer2_table}")
         computed_at = self.db.now()
         stored = 0
 
         for stat in map_stats:
-            team_id = stat["team_id"]
-            map_name = stat["map_name"]
-            if map_name not in maps:
+            team_id  = stat["team_id"]
+            map_name = stat.get(name_col) or ""
+            if pool is not None and map_name not in pool:
                 continue
             total = (stat.get("wins") or 0) + (stat.get("losses") or 0)
             if total < ELO_MIN_MATCHES_FOR_MAP:
                 continue
 
             overall_elo = overall.get(team_id, ELO_INITIAL_RATING)
-            win_rate = stat.get("win_rate") or 0.5
-            map_elo = overall_elo + (win_rate - 0.5) * ELO_MAP_WIN_RATE_SCALE
+            win_rate    = stat.get("win_rate") or 0.5
+            map_elo     = overall_elo + (win_rate - 0.5) * ELO_MAP_WIN_RATE_SCALE
 
             self.db.upsert("elo_team_ratings", {
-                "team_id": team_id,
-                "game": game,
-                "map_name": map_name,
-                "rating": round(map_elo, 2),
-                "matches": total,
-                "wins": stat.get("wins") or 0,
+                "team_id":    team_id,
+                "game":       game,
+                "map_name":   map_name,
+                "rating":     round(map_elo, 2),
+                "matches":    total,
+                "wins":       stat.get("wins") or 0,
                 "computed_at": computed_at,
             }, ["team_id", "game", "map_name"])
             stored += 1
 
-        logger.info("Map ELO: stored %d entries for %s", stored, game)
+        logger.info("Layer-2 ELO (%s): stored %d entries for %s", name_col, stored, game)
 
     # ------------------------------------------------------------------
     # Venue stats (online vs LAN)
@@ -356,7 +399,7 @@ class EloEngine:
         The JOIN is fuzzy (LIKE) because tournament names don't always
         match exactly between the match table and liq_tournaments.
         """
-        match_table = "cs2_matches" if game == "cs2" else "val_matches"
+        match_table = _MATCH_TABLES.get(game, f"{game}_matches")
 
         # Bring in location from liq_tournaments via a fuzzy name match
         matches = self.db.execute(
@@ -528,8 +571,8 @@ class EloEngine:
         return {"game": game, "teams_with_elo": len(overall)}
 
     def sync_all(self, force: bool = False) -> dict:
-        """Sync both CS2 and Valorant."""
-        return {g: self.sync(g, force=force) for g in ("cs2", "val")}
+        """Sync all four supported games."""
+        return {g: self.sync(g, force=force) for g in ("cs2", "val", "dota2", "lol")}
 
     # ------------------------------------------------------------------
     # Reporting helpers
@@ -537,7 +580,7 @@ class EloEngine:
 
     def elo_rankings(self, game: str, top_n: int = 20) -> list[dict]:
         """Top N teams by overall ELO, joined with team name."""
-        team_table = "cs2_teams" if game == "cs2" else "val_teams"
+        team_table = _TEAM_TABLES.get(game, f"{game}_teams")
         return self.db.execute(
             f"SELECT e.team_id, e.rating, e.matches, e.wins, "
             f"       COALESCE(t.name, e.team_id) AS name "
@@ -550,31 +593,47 @@ class EloEngine:
 
     def team_map_strengths(self, team_id: str, game: str) -> list[dict]:
         """
-        Per-map ELO breakdown for a team, sorted strongest → weakest.
-        Each row shows the ELO, delta vs overall, match count, and whether
-        the rating is considered reliable (≥ ELO_MIN_MATCHES_FOR_MAP).
+        Per-slot ELO breakdown for a team, sorted strongest → weakest.
+
+        For CS2/Val: slot = map name.
+        For Dota2: slot = hero name (all heroes with ≥ ELO_MIN_MATCHES_FOR_MAP picks).
+        For LoL: slot = position.
         """
-        maps = CS2_MAP_POOL if game == "cs2" else VAL_MAP_POOL
+        # For fixed pools use the pool list; for dota2 use all stored heroes
+        if game in ("cs2", "val"):
+            pool: list[str] = CS2_MAP_POOL if game == "cs2" else VAL_MAP_POOL
+        elif game == "lol":
+            pool = LOL_POSITION_POOL
+        else:
+            # Dota2: pull all heroes with ELO stored for this team
+            rows = self.db.execute(
+                "SELECT map_name FROM elo_team_ratings "
+                "WHERE team_id=? AND game=? AND map_name != 'overall' "
+                "ORDER BY rating DESC LIMIT 30",
+                (team_id, game),
+            )
+            pool = [r["map_name"] for r in rows]
+
         overall = self.get_team_elo(team_id, game, "overall")
         result = []
-        for m in maps:
+        for slot in pool:
             rows = self.db.execute(
                 "SELECT rating, matches FROM elo_team_ratings "
                 "WHERE team_id=? AND game=? AND map_name=?",
-                (team_id, game, m),
+                (team_id, game, slot),
             )
             if rows:
                 elo = float(rows[0]["rating"])
                 n = rows[0]["matches"]
             else:
-                elo = overall   # fallback
+                elo = overall
                 n = 0
             result.append({
-                "map":             m,
-                "elo":             round(elo, 1),
+                "map":              slot,
+                "elo":              round(elo, 1),
                 "delta_vs_overall": round(elo - overall, 1),
-                "matches":         n,
-                "reliable":        n >= ELO_MIN_MATCHES_FOR_MAP,
+                "matches":          n,
+                "reliable":         n >= ELO_MIN_MATCHES_FOR_MAP,
             })
         return sorted(result, key=lambda x: x["elo"], reverse=True)
 
@@ -595,7 +654,7 @@ class EloEngine:
         }
 
     def _team_name(self, team_id: str, game: str) -> str:
-        table = "cs2_teams" if game == "cs2" else "val_teams"
+        table = _TEAM_TABLES.get(game, f"{game}_teams")
         rows = self.db.execute(
             f"SELECT name FROM {table} WHERE team_id=?", (team_id,)
         )

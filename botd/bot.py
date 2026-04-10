@@ -26,6 +26,8 @@ from botd.engine.signals import EloSignalEngine      # primary ELO engine
 from botd.signals import EsportsSignalEngine          # legacy weight-blend (kept for comparison)
 from botd.data.hltv import HLTVScraper
 from botd.data.vlr import VLRScraper
+from botd.data.dota import DotaScraper
+from botd.data.lol import LoLScraper
 from botd.data.liquipedia import LiquipediaScraper
 from botd.storage.db import BotDStorage
 
@@ -34,13 +36,13 @@ logger = logging.getLogger(__name__)
 
 class BotD:
     """
-    Bot D: Kalshi esports trading bot (CS2 + Valorant).
+    Bot D: Kalshi esports trading bot (CS2 + Valorant + Dota 2 + LoL).
 
     Architecture mirrors Bot B (sports) and Bot C (economics):
       - SQLite storage via BotDStorage
-      - Half-Kelly sizing via EsportsSignalEngine → shared kelly.py
+      - Two-layer ELO signal engine with game-specific adjustments
+      - Half-Kelly sizing → shared kelly.py
       - Paper trading via shared PaperTrader
-      - Modular signal engine (EsportsSignalEngine)
       - Plugs into shared orchestrator via signal_engine property
     """
 
@@ -52,6 +54,8 @@ class BotD:
         self.trader = PaperTrader(self.BOT_ID, db_path, PAPER_BANKROLL)
         self.hltv = HLTVScraper(db_path)
         self.vlr = VLRScraper(db_path)
+        self.dota = DotaScraper(db_path)
+        self.lol = LoLScraper(db_path)
         self.liq = LiquipediaScraper(db_path)
         logger.info(
             "Bot D initialised | bankroll=$%.2f | db=%s",
@@ -110,7 +114,7 @@ class BotD:
     # ------------------------------------------------------------------
 
     def _sync_data(self):
-        """Refresh stale data from all sources."""
+        """Refresh stale data from all sources (freshness-gated)."""
         logger.info("Syncing Liquipedia upcoming matches...")
         self.liq.sync_all(days=7)
 
@@ -124,11 +128,21 @@ class BotD:
             self.vlr.sync_rankings()
             self.vlr.sync_roster_changes(days=30)
 
+        if not self.db.is_fresh("dota2_teams", max_age_hours=24):
+            logger.info("Syncing Dota 2 data...")
+            self.dota.sync_teams()
+
+        if not self.db.is_fresh("lol_teams", max_age_hours=24):
+            logger.info("Syncing LoL data...")
+            self.lol.sync_teams()
+
     def full_sync(self):
         """Force a complete data refresh regardless of cache."""
-        logger.info("Starting full Bot D data sync...")
+        logger.info("Starting full Bot D data sync (all 4 games)...")
         self.hltv.sync_all()
         self.vlr.sync_all()
+        self.dota.sync_all()
+        self.lol.sync_all()
         self.liq.sync_all(days=7)
         logger.info("Full sync complete")
 
@@ -157,20 +171,20 @@ class BotD:
     def status(self) -> dict:
         """Return current status for the unified dashboard."""
         summary = self.trader.summary()
-
-        cs2_match_count = self.db.scalar("SELECT COUNT(*) FROM cs2_matches") or 0
-        val_match_count = self.db.scalar("SELECT COUNT(*) FROM val_matches") or 0
-        cs2_team_count = self.db.scalar("SELECT COUNT(*) FROM cs2_teams") or 0
-        val_team_count = self.db.scalar("SELECT COUNT(*) FROM val_teams") or 0
         upcoming_count = self.db.scalar(
             "SELECT COUNT(*) FROM liq_upcoming_matches WHERE match_datetime >= datetime('now')"
         ) or 0
-
         calibration = self.signal_engine.calibrate()
+
+        data = {}
+        for game in ("cs2", "val", "dota2", "lol"):
+            data[f"{game}_teams"]   = self.db.scalar(f"SELECT COUNT(*) FROM {game}_teams") or 0
+            data[f"{game}_matches"] = self.db.scalar(f"SELECT COUNT(*) FROM {game}_matches") or 0
+        data["upcoming_matches"] = upcoming_count
 
         return {
             "bot_id": self.BOT_ID,
-            "games": ["cs2", "val"],
+            "games": ["cs2", "val", "dota2", "lol"],
             "bankroll": summary["bankroll"],
             "total_pnl": summary["total_pnl"],
             "total_trades": summary["total_trades"],
@@ -179,13 +193,7 @@ class BotD:
                 if summary["total_trades"] > 0 else None
             ),
             "open_positions": summary["open_positions"],
-            "data": {
-                "cs2_teams": cs2_team_count,
-                "cs2_matches": cs2_match_count,
-                "val_teams": val_team_count,
-                "val_matches": val_match_count,
-                "upcoming_matches": upcoming_count,
-            },
+            "data": data,
             "calibration": calibration,
             "timestamp": datetime.utcnow().isoformat(sep=" ", timespec="seconds"),
         }

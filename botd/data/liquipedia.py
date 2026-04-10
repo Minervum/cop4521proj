@@ -38,8 +38,10 @@ from botd.config import LIQUIPEDIA_REQUEST_DELAY, DB_PATH
 logger = logging.getLogger(__name__)
 
 _GAME_APIS: dict[str, str] = {
-    "cs2": "https://liquipedia.net/counterstrike/api.php",
-    "val": "https://liquipedia.net/valorant/api.php",
+    "cs2":   "https://liquipedia.net/counterstrike/api.php",
+    "val":   "https://liquipedia.net/valorant/api.php",
+    "dota2": "https://liquipedia.net/dota2/api.php",
+    "lol":   "https://liquipedia.net/leagueoflegends/api.php",
 }
 
 _PRIZE_TIER_BREAKS: list[tuple[int, str]] = [
@@ -523,10 +525,10 @@ class LiquipediaScraper:
     # ------------------------------------------------------------------
 
     def sync_all(self, days: int = 7) -> dict:
-        """Sync upcoming matches and tournaments for both CS2 and Valorant."""
+        """Sync upcoming matches and tournaments for all four supported games."""
         logger.info("Starting full Liquipedia sync (next %d days)", days)
         results = {}
-        for game in ("cs2", "val"):
+        for game in ("cs2", "val", "dota2", "lol"):
             upcoming = self.sync_upcoming_matches(game, days)
             tournaments = self.sync_tournaments(game)
             results[game] = {
